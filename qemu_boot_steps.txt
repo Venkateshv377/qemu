@@ -1,0 +1,11 @@
+Compilation:
+
+mkdir build && cd build
+../configure --target-list="aarch64-softmmu,microblazeel-softmmu"
+
+Instance 1:
+~/Venkatesh/XFMEExpress/xilinx/xilinx_repo/pci_qemu/qemu/build/aarch64-softmmu/qemu-system-aarch64 -M arm-generic-fdt   -serial mon:stdio -serial /dev/null -display none -device loader,file=./bl32.elf,cpu-num=0 -device loader,file=./rootfs.cpio.gz.u-boot,addr=0x04000000,force-raw -device loader,file=./u-boot.elf -device loader,file=./Image,addr=0x00200000 -device loader,file=./system.dtb,addr=0x00100000 -device loader,file=./boot.scr,addr=0x20000000 -gdb tcp::9000  -dtb ./system.dtb  -net nic -net nic -net nic -net nic,netdev=eth0 -netdev user,id=eth0,tftp=/tftpboot -hw-dtb zynqmp-qemu-multiarch-arm.dtb -machine-path ~/Venkatesh/temp_files/tmp.1/ -global xlnx,zynqmp-boot.cpu-num=0 -global xlnx,zynqmp-boot.use-pmufw=true -m 4G -device pcie-pci-bridge,id=pcie_pci_bridge1 -device pci-bridge,id=pci_bridge1,bus=pcie_pci_bridge1,chassis_nr=3,addr=4 -device xilinx.zynqmp-sdhci,bus=pci_bridge1,addr=7 -device xilinx.zynqmp-sdhci,bus=pci_bridge1,addr=9 -drive file=sd_image64G.img,if=sd,index=3,format=raw -d trace:sdcard_normal_command,trace:sdcard_response,trace:sdhci_response4,trace:sdhci_response16
+
+Instance 2:
+~/Venkatesh/XFMEExpress/xilinx/xilinx_repo/pci_qemu/qemu/build/microblazeel-softmmu/qemu-system-microblazeel -M microblaze-fdt   -serial mon:stdio -serial /dev/null -display none -kernel ./pmu_rom_qemu_sha3.elf -device loader,file=./executable.elf -hw-dtb ./zynqmp-qemu-multiarch-pmu.dtb -machine-path ~/Venkatesh/temp_files/tmp.1/ -device loader,addr=0xfd1a0074,data=0x1011003,data-len=4 -device loader,addr=0xfd1a007C,data=0x1010f03,data-len=4
+
