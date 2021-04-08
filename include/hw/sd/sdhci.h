@@ -99,6 +99,42 @@ typedef struct SDHCIState {
     uint8_t sd_spec_version;
     uint8_t uhs_mode;
     uint8_t vendor;        /* For vendor specific functionality */
+
+	/* CQE Registers - Cap and Configure */
+    uint32_t cq_version;
+    uint32_t cq_cap;
+    uint32_t cq_config;
+    uint32_t cq_ctrl;
+	/* CQE Registers - Interrupt Control */
+	uint32_t cq_int_status;
+	uint32_t cq_int_status_en;
+	uint32_t cq_int_sig_en;
+	uint32_t cq_int_coalescing;
+	/* CQE Registers - Task Submission */
+	uint32_t cq_tdlba;
+	uint32_t cq_tdlbau;
+	uint32_t cq_task_doorbell;
+	uint32_t cq_task_comp_notif;
+	/* CQE Registers - Task Management */
+	uint32_t cq_dev_queue_status;
+	uint32_t cq_dev_pending_tasks;
+	uint32_t cq_task_clear;
+	uint32_t reserved;
+	/* CQE Registers - SOS and DCMD */
+	uint32_t cq_send_status_config1;
+	uint32_t cq_send_status_config2;
+	uint32_t cq_cmd_resp_dcmd_task;
+	/* CQE Registers - Error handling */
+	uint32_t cq_resp_mode_err_mask;
+	uint32_t cq_task_err_info;
+	uint32_t cq_cmd_resp_index;
+	uint32_t cq_cmd_resp_arg;
+
+
+    /*< public >*/
+    SDState *card;
+    uint8_t drive_index;
+    bool is_mmc;
 } SDHCIState;
 
 #define SDHCI_VENDOR_NONE       0
@@ -113,7 +149,8 @@ typedef struct SDHCIState {
  */
 #define SDHCI_QUIRK_NO_BUSY_IRQ    BIT(14)
 
-#define TYPE_PCI_SDHCI "sdhci-pci"
+//#define TYPE_PCI_SDHCI "sdhci-pci"
+#define TYPE_PCI_SDHCI "xilinx.zynqmp-sdhci"
 #define PCI_SDHCI(obj) OBJECT_CHECK(SDHCIState, (obj), TYPE_PCI_SDHCI)
 
 #define TYPE_SYSBUS_SDHCI "generic-sdhci"

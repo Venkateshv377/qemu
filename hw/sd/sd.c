@@ -37,6 +37,7 @@
 #include "hw/registerfields.h"
 #include "sysemu/block-backend.h"
 #include "hw/sd/sd.h"
+#include "hw/sd/sdhci.h"
 #include "migration/vmstate.h"
 #include "qapi/error.h"
 #include "qemu/bitmap.h"
@@ -49,8 +50,18 @@
 #include "sdmmc-internal.h"
 #include "trace.h"
 
-//#define DEBUG_SD 1
+extern SDHCIState *variable;	// Workedaround for Error "Card stuck at wrong state
+#define TYPE_SDHCI_BUS "sdhci-bus"
+#define SDHCI_BUS(obj) OBJECT_CHECK(SDBus, (obj), TYPE_SDHCI_BUS)
 
+//#define DEBUG_SD 1
+#define EMMC_SANDISK 1
+//#define DEBUG_LOGS	1
+
+int taskid, tm_opcode;
+
+static void sd_blk_read(SDState *sd, uint64_t addr, uint32_t len);
+#define BLK_READ_BLOCK(a, len)	sd_blk_read(sd, a, len)
 typedef enum {
     sd_r0 = 0,    /* no response */
     sd_r1,        /* normal response command */
@@ -80,6 +91,21 @@ enum SDCardStates {
     sd_receivingdata_state,
     sd_programming_state,
     sd_disconnect_state,
+	sd_bustest_state,
+	sd_sleep_state,
+};
+
+struct CommandQueue {
+	uint8_t reliable_write_req:1;
+	uint8_t read_write:1;
+	uint8_t tag_req:1;
+	uint8_t context_id:4;
+	uint8_t force_prog:1;
+	uint8_t priority:1;
+	uint8_t reserved:2;
+	uint8_t task_id:5;
+	uint16_t num_of_blocks;
+	uint32_t start_blk_addr;
 };
 
 struct SDState {
@@ -135,9 +161,13 @@ struct SDState {
     bool enable;
     uint8_t dat_lines;
     bool cmd_line;
+	uint8_t read_taskid, write_taskid;
+	struct CommandQueue cmdq[32];
+    uint32_t queue_status_reg;
 };
 
 static void sd_realize(DeviceState *dev, Error **errp);
+static void sd_erase(SDState *sd);
 
 static const char *sd_state_name(enum SDCardStates state)
 {
@@ -151,6 +181,8 @@ static const char *sd_state_name(enum SDCardStates state)
         [sd_receivingdata_state]    = "receivingdata",
         [sd_programming_state]      = "programming",
         [sd_disconnect_state]       = "disconnect",
+		[sd_bustest_state]			= "bustest",
+		[sd_sleep_state]			= "sleep",
     };
     if (state == sd_inactive_state) {
         return "inactive";
@@ -304,6 +336,9 @@ static void sd_set_ocr(SDState *sd)
 {
     /* All voltages OK */
     sd->ocr = R_OCR_VDD_VOLTAGE_WIN_HI_MASK;
+#ifdef EMMC_SANDISK
+    sd->ocr = 0x40FF8080;
+#endif
 }
 
 static void sd_ocr_powerup(void *opaque)
@@ -319,6 +354,7 @@ static void sd_ocr_powerup(void *opaque)
     if (!sd->mmc && sd->size > 1 * GiB) {
         sd->ocr = FIELD_DP32(sd->ocr, OCR, CARD_CAPACITY, 1);
     }
+    fprintf(stdout, "SD->OCR: 0x%x\n", sd->ocr);
 }
 
 static void sd_set_scr(SDState *sd)
@@ -347,12 +383,29 @@ static void sd_set_scr(SDState *sd)
 #define OID	"XY"
 #define PNM	"QEMU!"
 #define PRV	0x01
-#define MDT_YR	2006
-#define MDT_MON	2
+#define MDT_YR	2020
+#define MDT_MON	12
 
 static void sd_set_cid(SDState *sd)
 {
     if (sd->mmc) {
+#ifdef EMMC_SANDISK
+        sd->cid[0] = 0x45;
+        sd->cid[1] = 0x1;       /* CBX */
+        sd->cid[2] = 0x0;    /* OEM/Application ID (OID) */
+        sd->cid[3] = '0';    /* Fake product name (PNM) 48bit */
+        sd->cid[4] = '1';
+        sd->cid[5] = '6';
+        sd->cid[6] = 'G';
+        sd->cid[7] = '9';
+        sd->cid[8] = '2';
+        sd->cid[9] = 0x01;        /* Fake product revision (PRV) */
+        sd->cid[10] = 0xde;      /* Fake serial number (PSN) */
+        sd->cid[11] = 0xad;
+        sd->cid[12] = 0xbe;
+        sd->cid[13] = 0xef;
+        sd->cid[14] = ((MDT_YR - 1997) % 0x10); /* MDT */
+#else
         sd->cid[0] = MID;
         sd->cid[1] = 0x1;       /* CBX */
         sd->cid[2] = OID[0];    /* OEM/Application ID (OID) */
@@ -368,6 +421,7 @@ static void sd_set_cid(SDState *sd)
         sd->cid[12] = 0xbe;
         sd->cid[13] = 0xef;
         sd->cid[14] = ((MDT_YR - 1997) % 0x10); /* MDT */
+#endif
     } else {
         sd->cid[0] = MID;       /* Fake card manufacturer ID (MID) */
         sd->cid[1] = OID[0];    /* OEM/Application ID (OID) */
@@ -400,11 +454,103 @@ static const uint8_t sd_csd_rw_mask[16] = {
     0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xfc, 0xfe,
 };
 
+#ifndef EMMC_SANDISK
+static const uint32_t toshiba_ext_csd_list_16G_def[] = {
+0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,	/* 0 - 15 */
+0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,        /* 16 - 31 */
+0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,        /* 32 - 47 */
+0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0xFF,0x00,0x00,0x01,        /* 48 - 63 */
+0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,        /* 64 - 79 */
+0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,        /* 80 - 95 */
+0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,        /* 96 - 111*/
+0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,        /* 112 - 127 */
+0x00,0x00,0x01,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,        /* 128 - 143 */
+0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0xAC,0x03,0x00,        /* 144 - 159 */ 
+0x07,0x00,0x00,0x00,0x00,0x00,0x05,0x1F,0x04,0x00,0x00,0x00,0x00,0x00,0x00,0x00,        /* 160 - 175 */ 
+0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,        /* 176 - 191 */
+0x07,0x00,0x02,0x00,0x17,0x1f,0xFF,0xFF,0x66,0x66,0x00,0x00,0x00,0x1E,0x0F,0x3c,        /* 192 - 207 */
+0x0F,0x64,0x14,0x00,0x00,0xA0,0xD5,0x01,0x17,0x17,0x17,0x09,0x07,0x02,0x10,0xFF,        /* 208 - 223 */
+0x08,0x08,0x20,0x00,0x07,0xfC,0xf2,0x55,0x01,0x00,0x50,0x0A,0x88,0x22,0x66,0x22,        /* 224 - 239 */
+0x00,0xFF,0x00,0x00,0x00,0x00,0x00,0xFF,0xFF,0x00,0x00,0x00,0x00,0x00,0x00,0x00,        /* 240 - 255 */
+0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0xFF,0xFF,0x00,0x00,0x00,0x00,0x00,        /* 256 - 271 */
+0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,        /* 272 - 287 */
+0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,        /* 288 - 303 */
+0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,        /* 304 - 319 */
+0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,        /* 320 - 335 */
+0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,        /* 336 - 351 */
+0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,        /* 352 - 367 */
+0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,        /* 368 - 383 */
+0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,        /* 384 - 399 */
+0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,        /* 400 - 415 */
+0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,        /* 416 - 431 */
+0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,        /* 432 - 447 */
+0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,        /* 448 - 463 */
+0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,        /* 464 - 479 */
+0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x17,0x00,0x00,0x03,0x00,        /* 480 - 495 */
+0x7F,0x00,0x03,0x01,0x3F,0x3,0x01,0x03,0x04,0x00,0x00,0x00,0x00,0x00,0x00,0x00         /* 496 - 511 */
+};
+#else
+static const uint32_t sandisk_ext_csd_list_16G_def[] = {
+0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x01,	/* 0 - 15 */
+0x08,0x03,0x00,0x40,0x99,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x01,	/* 16 - 31 */
+0x1F,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,	/* 32 - 47 */
+0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x0A,0x00,0x00,0x00,	/* 48 - 63 */
+0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,	/* 64 - 79 */
+0x03,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,	/* 80 - 95 */
+0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,	/* 96 - 111*/
+0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x20,0x00,0x00,0x40,0x00,0x00,	/* 112 - 127 */
+0x00,0x00,0x01,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,	/* 128 - 143 */
+0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x4E,0x02,0x00,	/* 144 - 159 */ 
+0x07,0x00,0x00,0x02,0x00,0x00,0x15,0x1F,0x20,0x00,0x00,0x00,0x00,0x00,0x00,0x00,	/* 160 - 175 */ 
+0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x02,0x01,0x03,0x00,0x0D,0x00,0x00,0x00,0x00,	/* 176 - 191 */
+0x08,0x00,0x02,0x00,0x57,0x1f,0x19,0x03,0x00,0xDD,0x00,0x00,0x00,0x0A,0x0A,0x0A,	/* 192 - 207 */
+0x0A,0x0A,0x0A,0x01,0x00,0xA0,0xD5,0x01,0x17,0x12,0x17,0x07,0x06,0x10,0x01,0x03,	/* 208 - 223 */
+0x01,0x08,0x20,0x00,0x07,0xA6,0xA6,0x55,0x03,0x00,0x00,0x00,0x00,0xDD,0xDD,0x00,	/* 224 - 239 */
+0x01,0x5A,0x00,0x00,0x00,0x00,0x00,0x19,0x19,0x00,0x10,0x00,0x00,0xDD,0x02,0x00,	/* 240 - 255 */
+0x00,0x00,0x00,0x00,0x00,0x00,0x25,0x50,0x08,0x08,0x08,0x01,0x01,0x01,0x00,0x00,	/* 256 - 271 */
+0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,	/* 272 - 287 */
+0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,	/* 288 - 303 */
+0x00,0x00,0x00,0x1f,0x01,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,	/* 304 - 319 */
+0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,	/* 320 - 335 */
+0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,	/* 336 - 351 */
+0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,	/* 352 - 367 */
+0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,	/* 368 - 383 */
+0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,	/* 384 - 399 */
+0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,	/* 400 - 415 */
+0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,	/* 416 - 431 */
+0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,	/* 432 - 447 */
+0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,	/* 448 - 463 */
+0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,	/* 464 - 479 */
+0x00,0x00,0x00,0x00,0x00,0x00,0x01,0x00,0x00,0x00,0x00,0x10,0x00,0x03,0x03,0x00,	/* 480 - 495 */
+0x05,0x03,0x03,0x01,0x3F,0x3F,0x01,0x01,0x01,0x00,0x00,0x00,0x00,0x00,0x00,0x00,	/* 496 - 511 */
+};
+#endif
 static void sd_set_ext_csd(SDState *sd)
 {
     /* FIXME: come up with sane reset value */
     memset(sd->ext_csd, 0, sizeof(sd->ext_csd));
     sd->ext_csd[196] = 0x3f; /* Support all timing modes */
+    /* SEC_COUNT */
+    uint64_t sect;
+    blk_get_geometry(sd->blk, &sect);
+#ifdef EMMC_SANDISK
+    for (int i=0; i<512; i++){
+	    sd->ext_csd[i] = sandisk_ext_csd_list_16G_def[i];
+    }
+#else
+    for (int i=0; i<512; i++){
+	    sd->ext_csd[i] = toshiba_ext_csd_list_16G_def[i];
+    }
+#if 0
+    int boot_part_size = sd->ext_csd[226];
+    int rpmb_part_size = sd->ext_csd[168];
+    sect -= (boot_part_size + rpmb_part_size);
+    sd->ext_csd[215] = sd->ext_csd[21] = (sect >> 24) & 0xFF;
+    sd->ext_csd[214] = sd->ext_csd[20] = (sect >> 16) & 0xFF;
+    sd->ext_csd[213] = sd->ext_csd[19] = (sect >> 8) & 0xFF;
+    sd->ext_csd[212] = sd->ext_csd[18] = sect & 0xFF;
+#endif
+#endif
 }
 
 static void sd_set_csd(SDState *sd, uint64_t size)
@@ -412,6 +558,7 @@ static void sd_set_csd(SDState *sd, uint64_t size)
     uint32_t csize = (size >> (CMULT_SHIFT + HWBLOCK_SHIFT)) - 1;
     uint32_t sectsize = (1 << (SECTOR_SHIFT + 1)) - 1;
     uint32_t wpsize = (1 << (WPGROUP_SHIFT + 1)) - 1;
+    
 
     if (size <= 1 * GiB) { /* Standard Capacity SD */
         sd->csd[0] = sd->mmc ? 0x40 : 0x00;    /* CSD structure */
@@ -439,6 +586,7 @@ static void sd_set_csd(SDState *sd, uint64_t size)
             ((HWBLOCK_SHIFT << 6) & 0xc0);
         sd->csd[14] = 0x00;	/* File format group */
     } else {			/* SDHC */
+#if 0	// Qemu Default values
         size /= 512 * KiB;
         size -= 1;
         sd->csd[0] = 0x40;
@@ -448,20 +596,59 @@ static void sd_set_csd(SDState *sd, uint64_t size)
         sd->csd[4] = 0x5b;
         sd->csd[5] = 0x59;
         sd->csd[6] = 0x00;
-        sd->csd[7] = (size >> 16) & 0xff;
-        sd->csd[8] = (size >> 8) & 0xff;
-        sd->csd[9] = (size & 0xff);
-        sd->csd[10] = 0x7f;
+	sd->csd[7] = (size >> 16) & 0xff;
+	sd->csd[8] = (size >> 8) & 0xff;
+	sd->csd[9] = (size) & 0xff;
+	sd->csd[10] = 0x7f;
         sd->csd[11] = 0x80;
         sd->csd[12] = 0x0a;
         sd->csd[13] = 0x40;
         sd->csd[14] = 0x00;
+#endif
+#ifdef EMMC_SANDISK
+	// Sandisk 16GB eMMMC5.1 card values
+	uint32_t values[16] = {0xD0,0x0F,0x00,0x32,0x8F,0x59,0x03,0xFF,0xFF,0xFF,0xFF,0xEF,0x8A,0x40,0x40,0x00};
+        sd->csd[0] = values[0];
+        sd->csd[1] = values[1];
+        sd->csd[2] = values[2];
+        sd->csd[3] = values[3];
+        sd->csd[4] = values[4];
+        sd->csd[5] = values[5];
+        sd->csd[6] = values[6];
+        sd->csd[7] = values[7];
+        sd->csd[8] = values[8];
+        sd->csd[9] = values[9];
+	sd->csd[10] = values[10];
+        sd->csd[11] = values[11];
+        sd->csd[12] = values[12];
+        sd->csd[13] = values[13];
+        sd->csd[14] = values[14];
+#else
+	// Toshiba 16GB eMMC5.1 card values
+	uint32_t values[16] = {0xD0,0x0E,0x00,0x32,0x0F,0x59,0x03,0xFF,0xFF,0xFF,0xFF,0xEF,0x92,0x40,0x00,0x00};
+        sd->csd[0] = values[0];
+        sd->csd[1] = values[1];
+        sd->csd[2] = values[2];
+        sd->csd[3] = values[3];
+        sd->csd[4] = values[4];
+        sd->csd[5] = values[5];
+        sd->csd[6] = values[6];
+        sd->csd[7] = values[7];
+        sd->csd[8] = values[8];
+        sd->csd[9] = values[9];
+	sd->csd[10] = values[10];
+        sd->csd[11] = values[11];
+        sd->csd[12] = values[12];
+        sd->csd[13] = values[13];
+        sd->csd[14] = values[14];
+#endif
     }
     sd->csd[15] = (sd_crc7(sd->csd, 15) << 1) | 1;
 }
 
 static void sd_set_rca(SDState *sd, uint32_t val)
 {
+    fprintf(stdout, "SD->RCA: %d: sd->mmc: %d\n", val, sd->mmc);
     sd->rca = val;
 }
 
@@ -539,6 +726,7 @@ static int sd_req_crc_validate(SDRequest *req)
 static void sd_response_r1_make(SDState *sd, uint8_t *response)
 {
     stl_be_p(response, sd->card_status);
+//    fprintf(stdout, "%s: sd->card_status: 0x%x\n", __func__, sd->card_status);
 
     /* Clear the "clear on read" status bits */
     sd->card_status &= ~CARD_STATUS_C;
@@ -546,7 +734,8 @@ static void sd_response_r1_make(SDState *sd, uint8_t *response)
 
 static void sd_response_r3_make(SDState *sd, uint8_t *response)
 {
-    stl_be_p(response, sd->ocr & ACMD41_R3_MASK);
+//    stl_be_p(response, sd->ocr & ACMD41_R3_MASK);
+    stl_be_p(response, sd->ocr);
 }
 
 static void sd_response_r6_make(SDState *sd, uint8_t *response)
@@ -559,6 +748,8 @@ static void sd_response_r6_make(SDState *sd, uint8_t *response)
     sd->card_status &= ~(CARD_STATUS_C & 0xc81fff);
     stw_be_p(response + 0, sd->rca);
     stw_be_p(response + 2, status);
+//    fprintf(stdout, "%s: SD->RCA: 0x%x\t status: 0x%x\tresponse: 0x%x: 0x%x: 0x%x: 0x%x\n",
+//		    __func__, sd->rca, status, response[0], response[1], response[2], response[3]);
 }
 
 static void sd_response_r7_make(SDState *sd, uint8_t *response)
@@ -584,8 +775,14 @@ static void sd_reset(DeviceState *dev)
         sect = 0;
     }
     size = sect << 9;
+#ifdef DEBUG_LOGS
+    fprintf(stdout, "%s: %d: size: %ld\tsect: %ld\n", __func__, __LINE__, size, sect);
+#endif
 
     sect = sd_addr_to_wpnum(size) + 1;
+#ifdef DEBUG_LOGS
+    fprintf(stdout, "%s: %d: size: %ld\tsect: %ld\n", __func__, __LINE__, size, sect);
+#endif
 
     sd->state = sd_idle_state;
     sd->rca = 0x0000;
@@ -630,6 +827,9 @@ static void sd_cardchange(void *opaque, bool load, Error **errp)
     SDBus *sdbus;
     bool inserted = sd_get_inserted(sd);
     bool readonly = sd_get_readonly(sd);
+#ifdef DEBUG_LOGS
+    fprintf(stdout, "%s: %d\n", __func__, __LINE__);
+#endif
 
     if (inserted) {
         trace_sdcard_inserted(readonly);
@@ -770,37 +970,6 @@ void sd_set_cb(SDState *sd, qemu_irq readonly, qemu_irq insert)
     qemu_set_irq(insert, sd->blk ? blk_is_inserted(sd->blk) : 0);
 }
 
-static void sd_erase(SDState *sd)
-{
-    int i;
-    uint64_t erase_start = sd->erase_start;
-    uint64_t erase_end = sd->erase_end;
-
-    trace_sdcard_erase();
-    if (!sd->erase_start || !sd->erase_end) {
-        sd->card_status |= ERASE_SEQ_ERROR;
-        return;
-    }
-
-    if (FIELD_EX32(sd->ocr, OCR, CARD_CAPACITY)) {
-        /* High capacity memory card: erase units are 512 byte blocks */
-        erase_start *= 512;
-        erase_end *= 512;
-    }
-
-    erase_start = sd_addr_to_wpnum(erase_start);
-    erase_end = sd_addr_to_wpnum(erase_end);
-    sd->erase_start = 0;
-    sd->erase_end = 0;
-    sd->csd[14] |= 0x40;
-
-    for (i = erase_start; i <= erase_end; i++) {
-        if (test_bit(i, sd->wp_groups)) {
-            sd->card_status |= WP_ERASE_SKIP;
-        }
-    }
-}
-
 static uint32_t sd_wpbits(SDState *sd, uint64_t addr)
 {
     uint32_t i, wpnum;
@@ -830,6 +999,7 @@ static void mmc_function_switch(SDState *sd, uint32_t arg)
     uint32_t index = extract32(arg, 16, 8);
     uint32_t value = extract32(arg, 8, 8);
     uint8_t b = sd->ext_csd[index];
+//    fprintf(stdout, "%s: CMD6: acces: %d\tIndex: %d\tvalue: %d\n", __func__, access, index, value);
 
     switch (access) {
     case MMC_CMD6_ACCESS_COMMAND_SET:
@@ -918,7 +1088,9 @@ static void sd_lock_command(SDState *sd)
         sd->card_status &= ~CARD_IS_LOCKED;
         sd->pwd_len = 0;
         /* Erasing the entire card here! */
-        fprintf(stderr, "SD: Card force-erased by CMD42\n");
+#ifdef DEBUG_LOGS
+//        fprintf(stderr, "SD: Card force-erased by CMD42\n");
+#endif
         return;
     }
 
@@ -964,6 +1136,8 @@ static sd_rsp_type_t sd_normal_command(SDState *sd, SDRequest req)
 {
     uint32_t rca = 0x0000;
     uint64_t addr = (sd->ocr & (1 << 30)) ? (uint64_t) req.arg << 9 : req.arg;
+//	int io_len, ret = 0;
+//	fprintf(stdout, "addr: 0x%lx\treq.arg: 0x%x\n", addr, req.arg);
 
     /* CMD55 precedes an ACMD, so we are not interested in tracing it.
      * However there is no ACMD55, so we want to trace this particular case.
@@ -987,15 +1161,19 @@ static sd_rsp_type_t sd_normal_command(SDState *sd, SDRequest req)
     if (sd->multi_blk_cnt != 0 && !(req.cmd == 18 || req.cmd == 25)) {
         sd->multi_blk_cnt = 0;
     }
-
+#if 0
     if (sd_cmd_class[req.cmd] == 6 && FIELD_EX32(sd->ocr, OCR, CARD_CAPACITY)) {
         /* Only Standard Capacity cards support class 6 commands */
         return sd_illegal;
     }
+#endif
 
     switch (req.cmd) {
     /* Basic commands (Class 0 and Class 1) */
     case 0:	/* CMD0:   GO_IDLE_STATE */
+#ifdef DEBUG_LOGS
+	fprintf(stdout, "***** Entering: %s: %d: Issuing CMD0 in QEMU\n", __func__, __LINE__);
+#endif
         switch (sd->state) {
         case sd_inactive_state:
             return sd->spi ? sd_r1 : sd_r0;
@@ -1011,6 +1189,9 @@ static sd_rsp_type_t sd_normal_command(SDState *sd, SDRequest req)
         /* MMC: Powerup & send r3
          * SD: send r1 in spi mode
          */
+#ifdef DEBUG_LOGS
+	fprintf(stdout, "***** Entering: %s: %d: Issuing CMD1 in QEMU\n", __func__, __LINE__);
+#endif
         if (sd->mmc) {
             sd_ocr_powerup(sd);
             return sd->state == sd_idle_state ?
@@ -1024,6 +1205,9 @@ static sd_rsp_type_t sd_normal_command(SDState *sd, SDRequest req)
         return sd_r1;
 
     case 2:	/* CMD2:   ALL_SEND_CID */
+#ifdef DEBUG_LOGS
+	fprintf(stdout, "***** Entering: %s: %d: Issuing CMD2 in QEMU\n", __func__, __LINE__);
+#endif
         if (sd->spi)
             goto bad_cmd;
         switch (sd->state) {
@@ -1042,6 +1226,9 @@ static sd_rsp_type_t sd_normal_command(SDState *sd, SDRequest req)
 
     case 3:	/* CMD3:   SEND_RELATIVE_ADDR */
                 /*         MMC: SET_RELATEIVE_ADDR */
+#ifdef DEBUG_LOGS
+	fprintf(stdout, "***** Entering: %s: %d: Issuing CMD3 in QEMU\n", __func__, __LINE__);
+#endif
         if (sd->spi)
             goto bad_cmd;
         switch (sd->state) {
@@ -1058,6 +1245,9 @@ static sd_rsp_type_t sd_normal_command(SDState *sd, SDRequest req)
         break;
 
     case 4:	/* CMD4:   SEND_DSR */
+#ifdef DEBUG_LOGS
+	fprintf(stdout, "***** Entering: %s: %d: Issuing CMD4 in QEMU\n", __func__, __LINE__);
+#endif
         if (sd->spi)
             goto bad_cmd;
         switch (sd->state) {
@@ -1070,9 +1260,40 @@ static sd_rsp_type_t sd_normal_command(SDState *sd, SDRequest req)
         break;
 
     case 5: /* CMD5: reserved for SDIO cards */
-        return sd_illegal;
+#ifdef DEBUG_LOGS
+		fprintf(stdout, "%s: Issuing CMD5: state: %d\n", __func__, sd->state);
+#endif
+		if (sd->spi)
+			goto bad_cmd;
+        switch (sd->state) {
+            case sd_standby_state:
+#ifdef DEBUG_LOGS
+				fprintf(stdout, "CMD5: Entering into SLEEP state: req.arg: 0x%x\n", req.arg);
+#endif
+				if ((req.arg >> 15) & 0x1)
+					sd->card_status = sd_sleep_state << 9;
+				sd->state = sd_sleep_state;
+				break;
+            case sd_sleep_state:
+#ifdef DEBUG_LOGS
+				fprintf(stdout, "CMD5: Exiting from SLEEP state: req.arg: 0x%x\n", req.arg);
+#endif
+                if (!((req.arg >> 15) & 0x1))
+                    sd->card_status = sd_standby_state << 9;
+				sd->state = sd_standby_state;
+				break;
+        default:
+            break;
+        }
+#ifdef DEBUG_LOGS
+		fprintf(stdout, "%s: sd->card_status: 0x%x\tsd->state: %d\n", __func__, sd->card_status, sd->state);
+        return sd_r1b;
+#endif
 
     case 6:	/* CMD6:   SWITCH_FUNCTION */
+#ifdef DEBUG_LOGS
+	fprintf(stdout, "***** Entering: %s: %d: Issuing CMD6 in QEMU: arg: 0x%x\n", __func__, __LINE__, req.arg);
+#endif
         switch (sd->mode) {
         case sd_data_transfer_mode:
             if (sd->mmc) {
@@ -1094,14 +1315,22 @@ static sd_rsp_type_t sd_normal_command(SDState *sd, SDRequest req)
         break;
 
     case 7:	/* CMD7:   SELECT/DESELECT_CARD */
+#ifdef DEBUG_LOGS
+	fprintf(stdout, "***** Entering: %s: %d: Issuing CMD7 in QEMU\n", __func__, __LINE__);
+#endif
+	fprintf(stdout, "CMD7: sd->card_status: 0x%x\tsd->state: %d\n", sd->card_status, sd->state);
         if (sd->spi)
             goto bad_cmd;
         switch (sd->state) {
         case sd_standby_state:
+#ifdef DEBUG_LOGS
+			fprintf(stdout, "sd->rca: 0x%x\t: rca: 0x%x\t, req.arg: 0x%x\n", sd->rca, rca, req.arg);
+#endif
+			rca = req.arg >> 16;
             if (sd->rca != rca)
                 return sd_r0;
-
             sd->state = sd_transfer_state;
+			sd->card_status = (sd_transfer_state << 9) | (1 << 8);
             return sd_r1b;
 
         case sd_transfer_state:
@@ -1110,6 +1339,7 @@ static sd_rsp_type_t sd_normal_command(SDState *sd, SDRequest req)
                 break;
 
             sd->state = sd_standby_state;
+			sd->card_status = sd_standby_state << 9;
             return sd_r1b;
 
         case sd_disconnect_state:
@@ -1117,6 +1347,7 @@ static sd_rsp_type_t sd_normal_command(SDState *sd, SDRequest req)
                 return sd_r0;
 
             sd->state = sd_programming_state;
+			sd->card_status = sd_programming_state << 9;
             return sd_r1b;
 
         case sd_programming_state:
@@ -1124,6 +1355,7 @@ static sd_rsp_type_t sd_normal_command(SDState *sd, SDRequest req)
                 break;
 
             sd->state = sd_disconnect_state;
+			sd->card_status = sd_disconnect_state << 9;
             return sd_r1b;
 
         default:
@@ -1132,12 +1364,16 @@ static sd_rsp_type_t sd_normal_command(SDState *sd, SDRequest req)
         break;
 
     case 8:	/* CMD8:   SEND_IF_COND */
+#ifdef DEBUG_LOGS
+	fprintf(stdout, "***** Entering: %s: %d: Issuing CMD8 in QEMU\n", __func__, __LINE__);
+#endif
         if (sd->mmc) {
             if (sd->state != sd_transfer_state) {
                 break;
             }
             sd->state = sd_sendingdata_state;
             memcpy(sd->data, sd->ext_csd, 512);
+
             sd->data_start = 0;
             sd->data_offset = 0;
             return sd_r1;
@@ -1161,6 +1397,9 @@ static sd_rsp_type_t sd_normal_command(SDState *sd, SDRequest req)
         return sd_r7;
 
     case 9:	/* CMD9:   SEND_CSD */
+#ifdef DEBUG_LOGS
+	fprintf(stdout, "***** Entering: %s: %d: Issuing CMD9 in QEMU: sd->state: %x\n", __func__, __LINE__, sd->state);
+#endif
         switch (sd->state) {
         case sd_standby_state:
             if (sd->rca != rca)
@@ -1175,6 +1414,9 @@ static sd_rsp_type_t sd_normal_command(SDState *sd, SDRequest req)
             memcpy(sd->data, sd->csd, 16);
             sd->data_start = addr;
             sd->data_offset = 0;
+#ifdef DEBUG_LOGS
+			fprintf(stdout, "sd->data_start: 0x%lx\tsd->offset: 0x%x\n", sd->data_start, sd->data_offset);
+#endif
             return sd_r1;
 
         default:
@@ -1183,6 +1425,9 @@ static sd_rsp_type_t sd_normal_command(SDState *sd, SDRequest req)
         break;
 
     case 10:	/* CMD10:  SEND_CID */
+#ifdef DEBUG_LOGS
+	fprintf(stdout, "***** Entering: %s: %d: Issuing CMD10 in QEMU\n", __func__, __LINE__);
+#endif
         switch (sd->state) {
         case sd_standby_state:
             if (sd->rca != rca)
@@ -1207,6 +1452,9 @@ static sd_rsp_type_t sd_normal_command(SDState *sd, SDRequest req)
     case 12:	/* CMD12:  STOP_TRANSMISSION */
         switch (sd->state) {
         case sd_sendingdata_state:
+#ifdef DEBUG_LOGS
+	    fprintf(stdout, "***** Entering: %s: %d: Issuing CMD12 in QEMU\n", __func__, __LINE__);
+#endif
             sd->state = sd_transfer_state;
             return sd_r1b;
 
@@ -1227,6 +1475,9 @@ static sd_rsp_type_t sd_normal_command(SDState *sd, SDRequest req)
             if (sd->rca != rca)
                 return sd_r0;
 
+#ifdef DEBUG_LOGS
+	    fprintf(stdout, "***** Entering: %s: %d: Issuing CMD13 in QEMU\n", __func__, __LINE__);
+#endif
             return sd_r1;
 
         default:
@@ -1234,7 +1485,24 @@ static sd_rsp_type_t sd_normal_command(SDState *sd, SDRequest req)
         }
         break;
 
+	case 14:	/* CMD14: BUS Test Read */
+#ifdef DEBUG_LOGS
+	    fprintf(stdout, "***** Entering: %s: %d: Issuing CMD14 in QEMU: sd->state: %d\n", __func__, __LINE__, sd->state);
+#endif
+		if (sd->mmc) {
+        	if (sd->state == sd_bustest_state) {
+            	sd->state = sd_receivingdata_state;
+	            sd->data_offset = 0;
+				sd->card_status = (sd_transfer_state << 9) | (1 << 8);
+    	        return sd_r1;
+			}
+		}
+		break;
+
     case 15:	/* CMD15:  GO_INACTIVE_STATE */
+#ifdef DEBUG_LOGS
+	fprintf(stdout, "***** Entering: %s: %d: Issuing CMD15 in QEMU\n", __func__, __LINE__);
+#endif
         if (sd->spi)
             goto bad_cmd;
         switch (sd->mode) {
@@ -1252,6 +1520,9 @@ static sd_rsp_type_t sd_normal_command(SDState *sd, SDRequest req)
 
     /* Block read commands (Classs 2) */
     case 16:	/* CMD16:  SET_BLOCKLEN */
+#ifdef DEBUG_LOGS
+	fprintf(stdout, "***** Entering: %s: %d: Issuing CMD16 in QEMU: req.arg: %d\n", __func__, __LINE__, req.arg);
+#endif
         switch (sd->state) {
         case sd_transfer_state:
             if (req.arg > (1 << HWBLOCK_SHIFT)) {
@@ -1269,9 +1540,14 @@ static sd_rsp_type_t sd_normal_command(SDState *sd, SDRequest req)
         break;
 
     case 17:	/* CMD17:  READ_SINGLE_BLOCK */
+#ifdef DEBUG_LOGS
+	fprintf(stdout, "***** Entering: %s: %d: Issuing CMD17 in QEMU\n", __func__, __LINE__);
+#endif
         switch (sd->state) {
         case sd_transfer_state:
-
+#ifdef DEBUG_LOGS
+	    fprintf(stdout, "CMD17: blkcnt: %d: data_start: 0x%lx: blklen: %d\n", variable->blkcnt, addr, sd->blk_len);
+#endif
             if (addr + sd->blk_len > sd->size) {
                 sd->card_status |= ADDRESS_ERROR;
                 return sd_r1;
@@ -1288,6 +1564,10 @@ static sd_rsp_type_t sd_normal_command(SDState *sd, SDRequest req)
         break;
 
     case 18:	/* CMD18:  READ_MULTIPLE_BLOCK */
+#ifdef DEBUG_LOGS
+	fprintf(stdout, "CMD18: blkcnt: %d: data_start: 0x%lx: blklen: %d\n", variable->blkcnt, addr, sd->blk_len);
+	fprintf(stdout, "***** Entering: %s: %d: Issuing CMD18 in QEMU\n", __func__, __LINE__);
+#endif
         switch (sd->state) {
         case sd_transfer_state:
 
@@ -1299,6 +1579,7 @@ static sd_rsp_type_t sd_normal_command(SDState *sd, SDRequest req)
             sd->state = sd_sendingdata_state;
             sd->data_start = addr;
             sd->data_offset = 0;
+            sd->multi_blk_cnt = variable->blkcnt;	// Workedaround for Error "Card stuck at wrong state
             return sd_r1;
 
         default:
@@ -1307,17 +1588,23 @@ static sd_rsp_type_t sd_normal_command(SDState *sd, SDRequest req)
         break;
 
     case 19:    /* CMD19: SEND_TUNING_BLOCK (SD) */
-        if (sd->spec_version < SD_PHY_SPECv3_01_VERS) {
-            break;
-        }
-        if (sd->state == sd_transfer_state) {
-            sd->state = sd_sendingdata_state;
-            sd->data_offset = 0;
-            return sd_r1;
-        }
+#ifdef DEBUG_LOGS
+	fprintf(stdout, "***** Entering: %s: %d: Issuing CMD19 in QEMU\n", __func__, __LINE__);
+#endif
+		if (sd->mmc) {
+        	if (sd->state == sd_transfer_state) {
+            	sd->state = sd_bustest_state;
+	            sd->data_offset = 0;
+				sd->card_status = sd_bustest_state << 9;
+    	        return sd_r1;
+        	}
+		}
         break;
 
     case 21:    /* CMD21: mmc SEND TUNING_BLOCK */
+#ifdef DEBUG_LOGS
+	fprintf(stdout, "***** Entering: %s: %d: Issuing CMD21 in QEMU\n", __func__, __LINE__);
+#endif
         if (sd->mmc && (sd->state == sd_transfer_state)) {
             sd->state = sd_sendingdata_state;
             sd->data_offset = 0;
@@ -1326,11 +1613,17 @@ static sd_rsp_type_t sd_normal_command(SDState *sd, SDRequest req)
         break;
 
     case 23:    /* CMD23: SET_BLOCK_COUNT */
+#ifdef DEBUG_LOGS
+	fprintf(stdout, "***** Entering: %s: %d: Issuing CMD23 in QEMU\n", __func__, __LINE__);
+#endif
         if (sd->spec_version < SD_PHY_SPECv3_01_VERS) {
             break;
         }
         switch (sd->state) {
         case sd_transfer_state:
+#ifdef DEBUG_LOGS
+	    fprintf(stdout,"CMD23: req.arg: %d\n", req.arg);
+#endif
             sd->multi_blk_cnt = req.arg;
             return sd_r1;
 
@@ -1343,6 +1636,10 @@ static sd_rsp_type_t sd_normal_command(SDState *sd, SDRequest req)
     case 24:	/* CMD24:  WRITE_SINGLE_BLOCK */
         switch (sd->state) {
         case sd_transfer_state:
+#ifdef DEBUG_LOGS
+	    fprintf(stdout, "***** Entering: %s: %d: Issuing CMD24 in QEMU\n", __func__, __LINE__);
+	    fprintf(stdout, "CMD24: blkcnt: %d: data_start: 0x%lx: blklen: %d\n", variable->blkcnt, addr, sd->blk_len);
+#endif
             /* Writing in SPI mode not implemented.  */
             if (sd->spi)
                 break;
@@ -1373,6 +1670,10 @@ static sd_rsp_type_t sd_normal_command(SDState *sd, SDRequest req)
     case 25:	/* CMD25:  WRITE_MULTIPLE_BLOCK */
         switch (sd->state) {
         case sd_transfer_state:
+#ifdef DEBUG_LOGS
+	    fprintf(stdout, "***** Entering: %s: %d: Issuing CMD25 in QEMU\n", __func__, __LINE__);
+	    fprintf(stdout, "CMD25: blkcnt: %d: data_start: 0x%lx: blklen: %d\n", variable->blkcnt, addr, sd->blk_len);
+#endif
             /* Writing in SPI mode not implemented.  */
             if (sd->spi)
                 break;
@@ -1386,6 +1687,7 @@ static sd_rsp_type_t sd_normal_command(SDState *sd, SDRequest req)
             sd->data_start = addr;
             sd->data_offset = 0;
             sd->blk_written = 0;
+            sd->multi_blk_cnt = variable->blkcnt;	// Workedaround fix for Error "Card stuck at wrong state"
 
             if (sd_wp_addr(sd, sd->data_start)) {
                 sd->card_status |= WP_VIOLATION;
@@ -1430,6 +1732,10 @@ static sd_rsp_type_t sd_normal_command(SDState *sd, SDRequest req)
 
     /* Write protection (Class 6) */
     case 28:	/* CMD28:  SET_WRITE_PROT */
+#ifdef DEBUG_LOGS
+	    fprintf(stdout, "***** Entering: %s: %d: Issuing CMD28 in QEMU: sd->state: %d\taddr: 0x%lx: sd->size: 0x%lx\n",
+						__func__, __LINE__, sd->state, addr, sd->size);
+#endif
         switch (sd->state) {
         case sd_transfer_state:
             if (addr >= sd->size) {
@@ -1484,6 +1790,9 @@ static sd_rsp_type_t sd_normal_command(SDState *sd, SDRequest req)
     /* Erase commands (Class 5) */
     case 32:	/* CMD32:  ERASE_WR_BLK_START */
     case 35:
+#ifdef DEBUG_LOGS
+	fprintf(stdout, "Issuing CMD32, CMD35: req.arg: 0x%x\n", req.arg);
+#endif
         switch (sd->state) {
         case sd_transfer_state:
             sd->erase_start = req.arg;
@@ -1496,6 +1805,9 @@ static sd_rsp_type_t sd_normal_command(SDState *sd, SDRequest req)
 
     case 33:	/* CMD33:  ERASE_WR_BLK_END */
     case 36:
+#ifdef DEBUG_LOGS
+	fprintf(stdout, "Issuing CMD33, CMD36: req.arg: 0x%x\n", req.arg);
+#endif
         switch (sd->state) {
         case sd_transfer_state:
             sd->erase_end = req.arg;
@@ -1507,6 +1819,9 @@ static sd_rsp_type_t sd_normal_command(SDState *sd, SDRequest req)
         break;
 
     case 38:	/* CMD38:  ERASE */
+#ifdef DEBUG_LOGS
+	fprintf(stdout, "Issuing CMD38\n");
+#endif
         switch (sd->state) {
         case sd_transfer_state:
             if (sd->csd[14] & 0x30) {
@@ -1538,6 +1853,101 @@ static sd_rsp_type_t sd_normal_command(SDState *sd, SDRequest req)
             break;
         }
         break;
+
+	case 44:	/* CMD44: Queued task parameters */
+		switch (sd->state) {
+		case sd_transfer_state:
+			taskid = (req.arg >> 16) & 0x1F;
+			fprintf(stdout, "Entering CMD44: TaskID: %d\n", taskid);
+			if (taskid > 31){
+				fprintf(stdout, "Task ID exceeds CMDQ_DEPTH\n");
+				return sd_illegal;
+			}else if (taskid == sd->cmdq[taskid].task_id){
+				fprintf(stdout, "Task ID already in use\n");
+				return sd_illegal;
+			}
+			sd->cmdq[taskid].task_id = taskid;
+			sd->cmdq[taskid].reliable_write_req = (req.arg >> 31) & 0x1;
+			sd->cmdq[taskid].read_write = (req.arg >> 30) & 0x1;
+			sd->cmdq[taskid].tag_req = (req.arg >> 29) & 0x1;
+			sd->cmdq[taskid].context_id = (req.arg >> 25) & 0xF;
+			sd->cmdq[taskid].force_prog = (req.arg >> 24) & 0x1;
+			sd->cmdq[taskid].priority = (req.arg >> 23) & 0x1;
+			sd->cmdq[taskid].num_of_blocks = req.arg & 0xFF;
+			return sd_r1;
+
+		default:
+			break;
+		}
+
+	case 45:	/* CMD45: Queued task address */
+		switch (sd->state) {
+		case sd_transfer_state:
+		case sd_sendingdata_state:
+		case sd_receivingdata_state:
+		case sd_programming_state:
+			fprintf(stdout, "Entering CMD45: TaskID: %d\treq.arg: 0x%lx\n", taskid, req.arg);
+			sd->cmdq[taskid].start_blk_addr = req.arg;
+            /* Updating QSR with Task ID */
+            sd->queue_status_reg |= (1 << taskid);
+			return sd_r1;
+
+		default:
+			break;
+		}
+		break;
+	
+	case 46:	/* CMD46: Execute Read Task */
+		fprintf(stdout, "Entering CMD46\n");
+		switch (sd->state) {
+		case sd_transfer_state:
+			sd->read_taskid = (req.arg >> 16) & 0x1F;
+			fprintf(stdout, "%s: %d: sd->read_taskid: %d\n", __func__, __LINE__, sd->read_taskid);
+
+			sd->state = sd_sendingdata_state;
+            sd->data_start = sd->cmdq[sd->read_taskid].start_blk_addr;
+            sd->data_offset = 0;
+            sd->multi_blk_cnt = sd->cmdq[sd->read_taskid].num_of_blocks;
+			return sd_r1;
+		}
+		break;
+	
+	case 47:	/* CMD47: Execute Write Task */
+		fprintf(stdout, "Entering CMD47\n");
+		switch (sd->state) {
+		case sd_transfer_state:
+			sd->write_taskid = (req.arg >> 16) & 0x1F;
+			fprintf(stdout, "%s: %d: sd->write_taskid: %d\n", __func__, __LINE__, sd->write_taskid);
+
+			sd->state = sd_receivingdata_state;
+            sd->data_start = sd->cmdq[sd->write_taskid].start_blk_addr;
+            sd->data_offset = 0;
+			return sd_r1;
+		}
+		break;
+
+	case 48:	/* CMD48: Command Queue Task Management */
+		fprintf(stdout, "Entering CMD48\n");
+		switch (sd->state) {
+		case sd_transfer_state:
+			tm_opcode = req.arg & 0xF;
+			if (tm_opcode == 2){
+				taskid = (req.arg >> 16) & 0x1F;
+				sd->cmdq[taskid].task_id = 0;
+				sd->cmdq[taskid].reliable_write_req = 0;
+				sd->cmdq[taskid].read_write = 0;
+				sd->cmdq[taskid].tag_req = 0;
+				sd->cmdq[taskid].context_id = 0; 
+				sd->cmdq[taskid].force_prog = 0;
+				sd->cmdq[taskid].priority = 0;
+				sd->cmdq[taskid].num_of_blocks = 0;
+                fprintf(stdout, "Cleared the task: %d\n", taskid);
+			} else if (tm_opcode == 1) {
+				memset (sd->cmdq, 0, sizeof(sd->cmdq));
+			}
+			sd->state = sd_programming_state;
+			return sd_r1b;
+		}
 
     case 52 ... 54:
         /* CMD52, CMD53, CMD54: reserved for SDIO cards
@@ -1666,6 +2076,7 @@ static sd_rsp_type_t sd_app_command(SDState *sd,
         break;
 
     case 23:	/* ACMD23: SET_WR_BLK_ERASE_COUNT */
+	fprintf(stdout, "ACMD23\n");
         switch (sd->state) {
         case sd_transfer_state:
             return sd_r1;
@@ -1826,6 +2237,7 @@ int sd_do_command(SDState *sd, SDRequest *req,
     last_state = sd->state;
     sd_set_mode(sd);
 
+//    fprintf(stdout, "%s: %d: req->cmd: %d\n", __func__, __LINE__, req->cmd);
     if (sd->expecting_acmd) {
         sd->expecting_acmd = false;
         rtype = sd_app_command(sd, *req);
@@ -1840,8 +2252,13 @@ int sd_do_command(SDState *sd, SDRequest *req,
          * (Do this now so they appear in r1 responses.)
          */
         sd->current_cmd = req->cmd;
-        sd->card_status &= ~CURRENT_STATE;
-        sd->card_status |= (last_state << 9);
+		if (!(req->cmd==5) && !(req->cmd==7) && !(req->cmd==14) && !(req->cmd==19)){
+			sd->card_status &= ~CURRENT_STATE;
+			sd->card_status |= (last_state << 9);
+		}
+#ifdef DEBUG_LOGS
+		fprintf(stdout, "sd->card_status: 0x%x: sd->state: %d\n", sd->card_status, sd->state);
+#endif
     }
 
 send_response:
@@ -1849,6 +2266,13 @@ send_response:
     case sd_r1:
     case sd_r1b:
         sd_response_r1_make(sd, response);
+#if 1
+        if (req->cmd == 13 && (req->arg >> 15)){
+            /* Updating QSR with Task ID */
+            memcpy(response, &sd->queue_status_reg, sizeof(sd->queue_status_reg));
+            fprintf(stdout, "SD: Updating the Task ID for CMD13: queue_stat_reg: 0x%x\tresponse: %x\n", sd->queue_status_reg, *(uint32_t*)(response+0));
+        }
+#endif
         rsplen = 4;
         break;
 
@@ -1900,6 +2324,11 @@ send_response:
     return rsplen;
 }
 
+//#define BLK_READ_BLOCK(a, len)	sd_blk_read(sd, a, len)
+#define BLK_WRITE_BLOCK(a, len)	sd_blk_write(sd, a, len)
+#define APP_READ_BLOCK(a, len)	memset(sd->data, 0xec, len)
+#define APP_WRITE_BLOCK(a, len)
+
 static void sd_blk_read(SDState *sd, uint64_t addr, uint32_t len)
 {
     trace_sdcard_read_block(addr, len);
@@ -1916,15 +2345,60 @@ static void sd_blk_write(SDState *sd, uint64_t addr, uint32_t len)
     }
 }
 
-#define BLK_READ_BLOCK(a, len)	sd_blk_read(sd, a, len)
-#define BLK_WRITE_BLOCK(a, len)	sd_blk_write(sd, a, len)
-#define APP_READ_BLOCK(a, len)	memset(sd->data, 0xec, len)
-#define APP_WRITE_BLOCK(a, len)
+static void sd_erase(SDState *sd)
+{
+    int i;
+    uint64_t erase_start = sd->erase_start;
+    uint64_t erase_end = sd->erase_end;
+    uint32_t length = (erase_end - erase_start);
+    uint32_t blkcnt = length / 512;
+
+    fprintf(stdout, "%s: %d: Erase_start: 0x%x\tErase_end: 0x%x\tlength: %d bytes\tblkcnt: %d\n", __func__, __LINE__, sd->erase_start, sd->erase_end, length, blkcnt);
+    trace_sdcard_erase();
+#if 0
+    if (!sd->erase_start || !sd->erase_end) {
+        sd->card_status |= ERASE_SEQ_ERROR;
+        return;
+    }
+#endif
+
+    if (FIELD_EX32(sd->ocr, OCR, CARD_CAPACITY)) {
+        /* High capacity memory card: erase units are 512 byte blocks */
+        erase_start *= 512;
+        erase_end *= 512;
+    }
+
+    erase_start = sd_addr_to_wpnum(erase_start);
+    erase_end = sd_addr_to_wpnum(erase_end);
+
+    /* Fix for erase */
+    memset(sd->data, 0, sizeof(sd->data));
+#if 0
+    int blksize = 512;
+    for (int erase_cnt=0; erase_cnt < blkcnt; erase_cnt++)
+	    BLK_WRITE_BLOCK((sd->erase_start + erase_cnt * blksize), blksize);
+#endif
+    sd->erase_start = 0;
+    sd->erase_end = 0;
+    sd->csd[14] |= 0x40;
+	fprintf(stdout, "Checking for write protection data: erase_start: %ld\terase_end: %ld\n", erase_start, erase_end);
+    for (i = erase_start; i <= erase_end; i++) {
+        if (test_bit(i, sd->wp_groups)) {
+			fprintf(stdout, "Write protection byte skipped: %d\n", i);
+            sd->card_status |= WP_ERASE_SKIP;
+        }
+		else
+		{
+    		int blksize = 4096;
+	    	BLK_WRITE_BLOCK((sd->erase_start + erase_start * blksize * 8), blksize);
+		}
+    }
+}
 
 void sd_write_data(SDState *sd, uint8_t value)
 {
     int i;
-
+    
     if (!sd->blk || !blk_is_inserted(sd->blk) || !sd->enable)
         return;
 
@@ -1944,6 +2418,9 @@ void sd_write_data(SDState *sd, uint8_t value)
     case 24:	/* CMD24:  WRITE_SINGLE_BLOCK */
         sd->data[sd->data_offset ++] = value;
         if (sd->data_offset >= sd->blk_len) {
+#ifdef DEBUG_LOGS
+	fprintf(stdout, "***** Entering: %s: %d: Issuing CMD24 in QEMU: value: %c\n", __func__, __LINE__, value);
+#endif
             /* TODO: Check CRC before committing */
             sd->state = sd_programming_state;
             BLK_WRITE_BLOCK(sd->data_start, sd->data_offset);
@@ -1955,6 +2432,9 @@ void sd_write_data(SDState *sd, uint8_t value)
         break;
 
     case 25:	/* CMD25:  WRITE_MULTIPLE_BLOCK */
+#ifdef DEBUG_LOGS
+	fprintf(stdout, "***** Entering: %s: %d: Issuing CMD25 in QEMU: value: %c\n", __func__, __LINE__, value);
+#endif
         if (sd->data_offset == 0) {
             /* Start of the block - let's check the address is valid */
             if (sd->data_start + sd->blk_len > sd->size) {
@@ -1975,7 +2455,9 @@ void sd_write_data(SDState *sd, uint8_t value)
             sd->data_start += sd->blk_len;
             sd->data_offset = 0;
             sd->csd[14] |= 0x40;
-
+#ifdef DEBUG_LOGS
+	    fprintf(stdout, "data_offset: %d: data_start:0x%lx: multi_blk_cnt: %d: blk_written: %d: blk_len: %d\n", sd->data_offset, sd->data_start, sd->multi_blk_cnt, sd->blk_written, sd->blk_len);
+#endif
             /* Bzzzzzzztt .... Operation complete.  */
             if (sd->multi_blk_cnt != 0) {
                 if (--sd->multi_blk_cnt == 0) {
@@ -2043,6 +2525,46 @@ void sd_write_data(SDState *sd, uint8_t value)
         }
         break;
 
+	case 47:	/* CMD47: Execute Write Task */
+		fprintf(stdout, "CMD47: write task execution: sd->write_taskid: %d\n", sd->write_taskid);
+		if (sd->cmdq[sd->write_taskid].read_write == 0) {
+			if (sd->data_offset == 0) {
+        	    /* Start of the block - let's check the address is valid */
+            	if (sd->cmdq[sd->write_taskid].start_blk_addr + sd->blk_len > sd->size) {
+                	sd->card_status |= ADDRESS_ERROR;
+	                break;
+    	        }
+        	    if (sd_wp_addr(sd, sd->cmdq[sd->write_taskid].start_blk_addr)) {
+            	    sd->card_status |= WP_VIOLATION;
+	                break;
+    	        }
+        	}
+	        sd->data[sd->data_offset++] = value;
+    	    if (sd->data_offset >= sd->blk_len) {
+        	    /* TODO: Check CRC before committing */
+	            sd->state = sd_programming_state;
+    	        BLK_WRITE_BLOCK(sd->cmdq[sd->write_taskid].start_blk_addr, sd->data_offset);
+	            sd->blk_written++;
+    	        sd->cmdq[sd->write_taskid].start_blk_addr += sd->blk_len;
+        	    sd->data_offset = 0;
+            	sd->csd[14] |= 0x40;
+#ifdef DEBUG_LOGS
+			    fprintf(stdout, "data_offset: %d: data_start:0x%lx: multi_blk_cnt: %d: blk_written: %d: blk_len: %d\n", sd->data_offset, sd->data_start, sd->multi_blk_cnt, sd->blk_written, sd->blk_len);
+#endif
+        	    /* Bzzzzzzztt .... Operation complete.  */
+	            if (sd->cmdq[sd->write_taskid].num_of_blocks != 0) {
+    	            if (--sd->cmdq[sd->write_taskid].num_of_blocks == 0) {
+        	            /* Stop! */
+            	        sd->state = sd_transfer_state;
+                	    break;
+	                }
+    	        }
+
+        	    sd->state = sd_receivingdata_state;
+	        }
+		}
+        break;
+
     case 56:	/* CMD56:  GEN_CMD */
         sd->data[sd->data_offset ++] = value;
         if (sd->data_offset >= sd->blk_len) {
@@ -2097,6 +2619,7 @@ static const uint8_t mmc_tunning_block_pattern[128] = {
 
 uint8_t sd_read_data(SDState *sd)
 {
+//    fprintf(stdout, "%s: %d: card_status: 0x%x: state: %d\n", __func__, __LINE__, sd->card_status, sd->state);
     /* TODO: Append CRCs */
     uint8_t ret;
     int io_len;
@@ -2118,6 +2641,7 @@ uint8_t sd_read_data(SDState *sd)
     trace_sdcard_read_data(sd->proto_name,
                            sd_acmd_name(sd->current_cmd),
                            sd->current_cmd, io_len);
+//    fprintf(stdout, "sd->data_offset: %d\n", sd->data_offset);
     switch (sd->current_cmd) {
     case 6:	/* CMD6:   SWITCH_FUNCTION */
         ret = sd->data[sd->data_offset ++];
@@ -2151,6 +2675,9 @@ uint8_t sd_read_data(SDState *sd)
         break;
 
     case 17:	/* CMD17:  READ_SINGLE_BLOCK */
+#ifdef DEBUG_LOGS
+	fprintf(stdout, "%s: %d:Reading Single Block\n", __func__,__LINE__);
+#endif
         if (sd->data_offset == 0)
             BLK_READ_BLOCK(sd->data_start, io_len);
         ret = sd->data[sd->data_offset ++];
@@ -2160,6 +2687,9 @@ uint8_t sd_read_data(SDState *sd)
         break;
 
     case 18:	/* CMD18:  READ_MULTIPLE_BLOCK */
+#ifdef DEBUG_LOGS
+//		    fprintf(stdout, "%s: %d:Reading Multiple Block\n", __func__,__LINE__);
+#endif
         if (sd->data_offset == 0) {
             if (sd->data_start + io_len > sd->size) {
                 sd->card_status |= ADDRESS_ERROR;
@@ -2218,6 +2748,39 @@ uint8_t sd_read_data(SDState *sd)
         if (sd->data_offset >= 4)
             sd->state = sd_transfer_state;
         break;
+
+	case 46:	/* CMD46: Execute Read Task */
+		/* read_taskid has to get it from do_command implementation pending */
+//		fprintf(stdout, "CMD46: read task execution: sd->read_taskid: %d\tio_len: %d\n", sd->read_taskid, io_len);
+		if (sd->cmdq[sd->read_taskid].read_write == 1){
+
+			if (sd->data_offset == 0) {
+				if (sd->cmdq[sd->read_taskid].start_blk_addr + io_len > sd->size) {
+					sd->card_status |= ADDRESS_ERROR;
+                    fprintf(stdout, "ADDRESS_ERROR\n");
+					return 0x00;
+				}
+				BLK_READ_BLOCK(sd->cmdq[sd->read_taskid].start_blk_addr, io_len);
+			}
+			ret = sd->data[sd->data_offset ++];
+//            fprintf(stdout, "sd->data_offset: %d\tret: %d\n", sd->data_offset, ret);
+			
+			if (sd->data_offset >= io_len) {
+                fprintf(stdout, "sd->data_offset: %d\tio_len: %d\n", sd->data_offset, io_len);
+				sd->cmdq[sd->read_taskid].start_blk_addr += io_len;
+				sd->data_offset = 0;
+				
+				if (sd->cmdq[sd->read_taskid].num_of_blocks != 0) {
+					if (--sd->cmdq[sd->read_taskid].num_of_blocks == 0) {
+                        fprintf(stdout, "num_of_blocks: %d\n", sd->cmdq[sd->read_taskid].num_of_blocks);
+						sd->state = sd_transfer_state;
+						break;
+					}
+				}
+			}
+		}
+		return ret;
+		break;
 
     case 51:	/* ACMD51: SEND_SCR */
         ret = sd->scr[sd->data_offset ++];

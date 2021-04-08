@@ -56,6 +56,8 @@
 # define PCI_DPRINTF(format, ...)       do { } while (0)
 #endif
 
+//#define DEBUG_LOG	1
+
 bool pci_available = true;
 
 static void pcibus_dev_print(Monitor *mon, DeviceState *dev, int indent);
@@ -1064,6 +1066,17 @@ static PCIDevice *do_pci_register_device(PCIDevice *pci_dev,
     pci_config_set_device_id(pci_dev->config, pc->device_id);
     pci_config_set_revision(pci_dev->config, pc->revision);
     pci_config_set_class(pci_dev->config, pc->class_id);
+#ifdef DEBUG_LOG
+    fprintf(stderr, "%s: %s: %d devfn: %d - vendor_id: 0x%x\n",__FILE__, __func__, __LINE__, devfn, pc->vendor_id);
+    fprintf(stderr, "%s: %s: %d devfn: %d - device_id: 0x%x\n",__FILE__, __func__, __LINE__, devfn, pc->device_id);
+    fprintf(stderr, "%s: %s: %d devfn: %d - class_id: 0x%x\n",__FILE__, __func__, __LINE__, devfn, pc->class_id);
+#endif
+
+    fprintf(stderr, "addr %02x:%02x.%x, "
+                   "pci id %04x:%04x (sub %04x:%04x)\n",
+                   pci_dev_bus_num(pci_dev), PCI_SLOT(pci_dev->devfn), PCI_FUNC(devfn),
+                   pci_get_word(pci_dev->config + PCI_VENDOR_ID), pci_get_word(pci_dev->config + PCI_DEVICE_ID),
+                   pci_get_word(pci_dev->config + PCI_SUBSYSTEM_VENDOR_ID), pci_get_word(pci_dev->config + PCI_SUBSYSTEM_ID));
 
     if (!pc->is_bridge) {
         if (pc->subsystem_vendor_id || pc->subsystem_id) {
@@ -1100,6 +1113,9 @@ static PCIDevice *do_pci_register_device(PCIDevice *pci_dev,
     pci_dev->config_write = config_write;
     bus->devices[devfn] = pci_dev;
     pci_dev->version_id = 2; /* Current pci device vmstate version */
+#ifdef DEBUG_LOG
+    fprintf(stderr, "%s, %s, %d\n", __FILE__, __func__, __LINE__);
+#endif
     return pci_dev;
 }
 
@@ -1428,6 +1444,7 @@ void pci_default_write_config(PCIDevice *d, uint32_t addr, uint32_t val_in, int 
 /* 0 <= irq_num <= 3. level must be 0 or 1 */
 static void pci_irq_handler(void *opaque, int irq_num, int level)
 {
+    fprintf(stdout, "%s: IRQ: num: %d\tlevel: %d\n", __func__, irq_num, level);
     PCIDevice *pci_dev = opaque;
     int change;
 
@@ -2107,6 +2124,9 @@ static void pci_qdev_realize(DeviceState *qdev, Error **errp)
     pci_dev = do_pci_register_device(pci_dev,
                                      object_get_typename(OBJECT(qdev)),
                                      pci_dev->devfn, errp);
+#ifdef DEBUG_LOG
+    fprintf(stderr, "%s, %s, %d\n", __FILE__, __func__, __LINE__);
+#endif
     if (pci_dev == NULL)
         return;
 

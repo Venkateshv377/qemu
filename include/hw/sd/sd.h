@@ -84,7 +84,7 @@ typedef enum {
 
 typedef struct {
     uint8_t cmd;
-    uint32_t arg;
+    uint64_t arg;
     uint8_t crc;
 } SDRequest;
 

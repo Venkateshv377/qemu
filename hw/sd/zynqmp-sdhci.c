@@ -41,6 +41,10 @@
 #include "qapi/error.h"
 #include "sdhci-internal.h"
 
+#include "qemu/module.h"
+
+//#define DEBUG_LOGS	1
+
 #ifndef ZYNQMP_SDHCI_ERR_DEBUG
 #define ZYNQMP_SDHCI_ERR_DEBUG 0
 #endif
@@ -51,8 +55,9 @@
      OBJECT_CHECK(ZynqMPSDHCIState, (obj), TYPE_ZYNQMP_SDHCI)
 
 #define ZYNQMP_SDHCI_PARENT_CLASS \
-    object_class_get_parent(object_class_by_name(TYPE_ZYNQMP_SDHCI))
+    object_class_get_parent(object_class_by_name(TYPE_PCI_SDHCI))
 
+#if 0
 typedef struct ZynqMPSDHCIState {
     /*< private >*/
     SDHCIState parent_obj;
@@ -62,10 +67,11 @@ typedef struct ZynqMPSDHCIState {
     uint8_t drive_index;
     bool is_mmc;
 } ZynqMPSDHCIState;
-
+#endif
 static void zynqmp_sdhci_slottype_handler(void *opaque, int n, int level)
 {
-    ZynqMPSDHCIState *s = ZYNQMP_SDHCI(opaque);
+//    ZynqMPSDHCIState *s = ZYNQMP_SDHCI(opaque);
+    SDHCIState *s = SYSBUS_SDHCI(opaque);
 
     assert(n == 0);
 
@@ -85,23 +91,35 @@ static void zynqmp_sdhci_slottype_handler(void *opaque, int n, int level)
 static void zynqmp_sdhci_reset(DeviceState *dev)
 {
     DeviceClass *dc_parent = DEVICE_CLASS(ZYNQMP_SDHCI_PARENT_CLASS);
-    ZynqMPSDHCIState *s = ZYNQMP_SDHCI(dev);
     SDHCIState *p = SYSBUS_SDHCI(dev);
 
     dc_parent->reset(dev);
-    if (s->is_mmc) {
+    if (p->is_mmc) {
         p->capareg = deposit64(p->capareg, R_SDHC_CAPAB_SLOT_TYPE_SHIFT,
                   R_SDHC_CAPAB_SLOT_TYPE_LENGTH, 0x01);
     }
+#ifdef DEBUG_LOGS
+    fprintf(stderr, "%s, %s, %d\n", __FILE__, __func__, __LINE__);
+#endif
 }
 
-static void zynqmp_sdhci_realize(DeviceState *dev, Error **errp)
+static void zynqmp_sdhci_realize(PCIDevice *dev, Error **errp)
 {
-    DeviceClass *dc_parent = DEVICE_CLASS(ZYNQMP_SDHCI_PARENT_CLASS);
-    ZynqMPSDHCIState *s = ZYNQMP_SDHCI(dev);
+//    DeviceClass *dc_parent = DEVICE_CLASS(ZYNQMP_SDHCI_PARENT_CLASS);
+    SDHCIState *s = PCI_SDHCI(dev);
     DriveInfo *di_sd, *di_mmc;
     DeviceState *carddev_sd;
     static int index_offset = 0;
+    DeviceState *pci_ds = &dev->qdev;
+
+    sdhci_initfn(s);
+
+    if (!s->memattr) {
+        s->memattr = g_malloc0(sizeof(MemTxAttrs));
+        *s->memattr =  MEMTXATTRS_UNSPECIFIED;
+    }
+
+    sdhci_common_realize(s, errp);
 
     /* Xilinx: This device is used in some Zynq-7000 devices which don't
      * set the drive-index property. In order to avoid errors we increament
@@ -113,12 +131,16 @@ static void zynqmp_sdhci_realize(DeviceState *dev, Error **errp)
         s->drive_index += index_offset;
         index_offset++;
     }
+#ifdef DEBUG_LOGS
+    fprintf(stderr, "%s, %s, %d drive_index: %d\n", __FILE__, __func__, __LINE__, s->drive_index);
+#endif
 
-    qdev_prop_set_uint8(dev, "sd-spec-version", 3);
-    qdev_prop_set_uint64(dev, "capareg", 0x280737ec6481);
-    qdev_prop_set_uint8(dev, "uhs", UHS_I);
+    qdev_prop_set_uint8(pci_ds, "sd-spec-version", 3);
+//    qdev_prop_set_uint64(pci_ds, "capareg", 0x280737ec6481);
+    qdev_prop_set_uint64(pci_ds, "capareg", 0x280737ecC881);
+    qdev_prop_set_uint8(pci_ds, "uhs", UHS_I);
     carddev_sd = qdev_new(TYPE_SD_CARD);
-    object_property_add_child(OBJECT(dev), "sd-card",
+    object_property_add_child(OBJECT(pci_ds), "sd-card",
                               OBJECT(carddev_sd));
     object_property_set_bool(OBJECT(carddev_sd), "spi", false, &error_fatal);
 
@@ -140,44 +162,107 @@ static void zynqmp_sdhci_realize(DeviceState *dev, Error **errp)
     }
 
     if (di_sd) {
+#ifdef DEBUG_LOGS
+	    fprintf(stderr, "%s: %s: %d di_sd->bus:%d unit:%d default:%d type:%d\n", __FILE__, __func__, __LINE__, di_sd->bus, di_sd->unit, 
+			    di_sd->is_default, di_sd->type);
+#endif
         qdev_prop_set_drive(carddev_sd, "drive", blk_by_legacy_dinfo(di_sd));
         object_property_set_bool(OBJECT(carddev_sd), "mmc", false, &error_fatal);
     }
 
     if (di_mmc) {
+#ifdef DEBUG_LOGS
+	    fprintf(stderr, "%s: %s: %d di_mmC->bus:%d unit:%d default:%d type:%d\n",  __FILE__, __func__, __LINE__, di_mmc->bus, 
+			    di_mmc->unit, di_mmc->is_default, di_mmc->type);
+#endif
         qdev_prop_set_drive(carddev_sd, "drive", blk_by_legacy_dinfo(di_mmc));
         object_property_set_bool(OBJECT(carddev_sd), "mmc", true, &error_fatal);
         s->is_mmc = true;
     }
 
+
+#ifdef DEBUG_LOGS
+    BusState *bus = qdev_get_child_bus(DEVICE(pci_ds), "sd-bus");
+    fprintf(stderr, "%s, %s, %d bus->name:%s\n", __FILE__, __func__, __LINE__, bus->name);
+#endif
+
     qdev_realize(carddev_sd,
-                           qdev_get_child_bus(DEVICE(dev), "sd-bus"),
+                           qdev_get_child_bus(DEVICE(pci_ds), "sd-bus"),
                            &error_abort);
-    qdev_init_gpio_in_named(dev, zynqmp_sdhci_slottype_handler, "SLOTTYPE", 1);
+
+    qdev_init_gpio_in_named(pci_ds, zynqmp_sdhci_slottype_handler, "SLOTTYPE", 1);
     s->card = SD_CARD(carddev_sd);
 
-    dc_parent->realize(dev, errp);
+//    dc_parent->realize(pci_ds, errp);
+
+    dev->config[PCI_CLASS_PROG] = 0x01; /* Standard Host supported DMA */
+    dev->config[PCI_INTERRUPT_PIN] = 0x01; /* interrupt pin A */
+    s->irq = pci_allocate_irq(dev);
+    s->dma_as = pci_get_address_space(dev);
+    pci_register_bar(dev, 0, PCI_BASE_ADDRESS_SPACE_MEMORY, &s->iomem);
+
+    if(s->irq) {
+	    fprintf(stderr, "%s, %s, %d: Irq VALID \n", __FILE__, __func__, __LINE__);
+    } else {
+	    fprintf(stderr, "%s, %s, %d: Irq INVALID \n", __FILE__, __func__, __LINE__);
+    }
+
+    if(s->dma_as) {
+	    fprintf(stderr, "%s, %s, %d: dma_as VALID \n", __FILE__, __func__, __LINE__);
+    } else {
+	    fprintf(stderr, "%s, %s, %d: dma_as INVALID \n", __FILE__, __func__, __LINE__);
+    }
 }
 
 static Property zynqmp_sdhci_properties[] = {
-    DEFINE_PROP_UINT8("drive-index", ZynqMPSDHCIState, drive_index, 0),
+//    DEFINE_SDHCI_COMMON_PROPERTIES(SDHCIState),
+    DEFINE_PROP_UINT8("sd-spec-version", SDHCIState, sd_spec_version, 3),
+    DEFINE_PROP_UINT8("uhs", SDHCIState, uhs_mode, UHS_NOT_SUPPORTED),
+    DEFINE_PROP_UINT64("capareg", SDHCIState, capareg, SDHC_CAPAB_REG_DEFAULT),
+    DEFINE_PROP_UINT8("drive-index", SDHCIState, drive_index, 0),
     DEFINE_PROP_END_OF_LIST(),
 };
+
+static void zynqmp_sdhci_exit(PCIDevice *dev)
+{
+    SDHCIState *s = PCI_SDHCI(dev);
+
+    sdhci_common_unrealize(s);
+    sdhci_uninitfn(s);
+#ifdef DEBUG_LOGS
+    fprintf(stderr, "%s, %s, %d\n", __FILE__, __func__, __LINE__);
+#endif
+}
 
 static void zynqmp_sdhci_class_init(ObjectClass *klass, void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(klass);
+    PCIDeviceClass *k = PCI_DEVICE_CLASS(klass);
 
-    dc->realize = zynqmp_sdhci_realize;
-    device_class_set_props(dc, zynqmp_sdhci_properties);
+    k->realize = zynqmp_sdhci_realize;
+    k->vendor_id = PCI_VENDOR_ID_REDHAT;
+    k->device_id = PCI_DEVICE_ID_REDHAT_SDHCI;
+    k->class_id = PCI_CLASS_SYSTEM_SDHCI;
+    k->exit = zynqmp_sdhci_exit;
     dc->reset = zynqmp_sdhci_reset;
+ 
+    device_class_set_props(dc, zynqmp_sdhci_properties);
+
+    sdhci_common_class_init(klass, data);
+#ifdef DEBUG_LOGS
+    fprintf(stderr, "%s, %s, %d\n", __FILE__, __func__, __LINE__);
+#endif
 }
 
 static const TypeInfo zynqmp_sdhci_info = {
-    .name          = TYPE_ZYNQMP_SDHCI,
-    .parent        = TYPE_SYSBUS_SDHCI,
+    .name          = TYPE_PCI_SDHCI,
+    .parent        = TYPE_PCI_DEVICE,
     .class_init    = zynqmp_sdhci_class_init,
-    .instance_size = sizeof(ZynqMPSDHCIState),
+    .instance_size = sizeof(SDHCIState),
+    .interfaces = (InterfaceInfo[]) {
+     { INTERFACE_CONVENTIONAL_PCI_DEVICE },
+     { }, 
+     },
 };
 
 static void zynqmp_sdhci_register_types(void)

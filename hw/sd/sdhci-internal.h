@@ -274,11 +274,107 @@ FIELD(SDHC_MAXCURR, V18_VDD2,         32, 8); /* since v4.20 */
 #define SDHC_HCVER                      0xFE
 #define SDHC_HCVER_VENDOR               0x24
 
-#define SDHC_REGISTERS_MAP_SIZE         0x100
+//#define SDHC_REGISTERS_MAP_SIZE         0x100
+#define SDHC_REGISTERS_MAP_SIZE         0x400
 #define SDHC_INSERTION_DELAY            (NANOSECONDS_PER_SECOND)
 #define SDHC_TRANSFER_DELAY             100
 #define SDHC_ADMA_DESCS_PER_DELAY       5
 #define SDHC_CMD_RESPONSE               (3 << 0)
+
+/* CQHCI registers */
+/* Config and Cap registers */
+#define CQHCI_BASE_ADDRESS				0x200
+#define CQHCI_VER						CQHCI_BASE_ADDRESS + 0x0
+#define CQHCI_CAP						CQHCI_BASE_ADDRESS + 0x4
+#define CQHCI_CFG						CQHCI_BASE_ADDRESS + 0x8
+#define CQHCI_CTL						CQHCI_BASE_ADDRESS + 0xC
+/* Interrupt Control registers */
+#define CQHCI_IS						CQHCI_BASE_ADDRESS + 0x10
+#define CQHCI_ISTE						CQHCI_BASE_ADDRESS + 0x14
+#define CQHCI_ISGE						CQHCI_BASE_ADDRESS + 0x18
+#define CQHCI_IC						CQHCI_BASE_ADDRESS + 0x1C
+/* Task Submission */
+#define CQHCI_TDLBA						CQHCI_BASE_ADDRESS + 0x20
+#define CQHCI_TDLBAU					CQHCI_BASE_ADDRESS + 0x24
+#define CQHCI_TDBR						CQHCI_BASE_ADDRESS + 0x28
+#define CQHCI_TCN						CQHCI_BASE_ADDRESS + 0x2C
+/* Task Management */
+#define CQHCI_DQS						CQHCI_BASE_ADDRESS + 0x30
+#define CQHCI_DPT						CQHCI_BASE_ADDRESS + 0x34
+#define CQHCI_TCLR						CQHCI_BASE_ADDRESS + 0x38
+/* SQS and DCMD */
+#define CQHCI_SSC1						CQHCI_BASE_ADDRESS + 0x40
+#define CQHCI_SSC2						CQHCI_BASE_ADDRESS + 0x44
+#define CQHCI_CRDCT						CQHCI_BASE_ADDRESS + 0x48
+/* Error Handling */
+#define CQHCI_RMEM						CQHCI_BASE_ADDRESS + 0x50
+#define CQHCI_TERRI						CQHCI_BASE_ADDRESS + 0x54
+#define CQHCI_CRI						CQHCI_BASE_ADDRESS + 0x58
+#define CQHCI_CRA						CQHCI_BASE_ADDRESS + 0x5C
+
+/* CQHCI Capabilities */
+#define MHz								1000000
+#define ITCFMUL_0h						(0.001 * MHz)
+#define ITCFMUL_1h						(0.01 * MHz)
+#define ITCFMUL_2h						(0.1 * MHz)
+#define ITCFMUL_3h						(1 * MHz)
+#define ITCFMUL_4h						(10 * MHz)
+#define ITCFVAL							0xC0	// Example value from Spec
+
+#pragma pack(1)
+
+struct task_descriptor{
+	uint8_t valid:1;
+	uint8_t end:1;
+	uint8_t interrupt:1;
+	uint8_t act:3;
+	uint8_t force_prog:1;
+	uint8_t context_id:4;
+	uint8_t tag_req:1;
+	uint8_t data_dir:1;
+	uint8_t priority:1;
+	uint8_t qbr:1;
+	uint8_t reliable_write:1;
+	uint16_t block_cnt;
+	uint32_t block_addr;
+	uint64_t reserved;
+};
+
+struct trans_descriptor {
+	uint8_t valid:1;
+	uint8_t end:1;
+	uint8_t interrupt:1;
+	uint8_t act:3;
+	uint16_t reserved1:10;
+	uint16_t length;
+	uint64_t address;
+	uint64_t reserved2;
+};
+
+struct CommandQueue {
+	uint8_t reliable_write_req:1;
+	uint8_t read_write:1;
+	uint8_t tag_req:1;
+	uint8_t context_id:4;
+	uint8_t force_prog:1;
+	uint8_t priority:1;
+	uint8_t reserved:2;
+	uint8_t task_id:5;
+	uint16_t block_cnt;
+	uint64_t block_addr;
+    uint64_t data_buf_addr[128];
+    uint8_t attr;
+};
+
+struct CQHCIState {
+		uint8_t trans_desc_len;
+		uint8_t task_slot_size;
+		uint8_t num_slots;
+		struct task_descriptor *task_desc;
+		struct trans_descriptor *trans_desc;
+		uint8_t max_seg;	//Max 128 seg allowed in sg list
+        struct CommandQueue cmdq[32]; 
+};
 
 enum {
     sdhc_not_stopped = 0, /* normal SDHC state */
@@ -342,5 +438,19 @@ void sdhci_uninitfn(SDHCIState *s);
 void sdhci_common_realize(SDHCIState *s, Error **errp);
 void sdhci_common_unrealize(SDHCIState *s);
 void sdhci_common_class_init(ObjectClass *klass, void *data);
+
+void add_task_to_queue(struct SDHCIState *s, struct CQHCIState *cqhci);
+
+static inline uint8_t get_task_id(uint32_t tag)
+{
+//		uint32_t tag = s->cq_task_doorbell;
+		uint8_t task_id = 0;
+		
+		while(!(tag & 0x1)){
+			task_id += 1;
+            tag >>= 1;
+        }
+		return task_id;
+}
 
 #endif
